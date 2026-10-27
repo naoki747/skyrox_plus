@@ -4,9 +4,16 @@
 `/proxy/`経由でそのサイトを表示します。
 
 ## 構成
-- `server.js` … Express + unblocker によるプロキシ本体
+- `server.js` … 共通ミドルウェアと Express + unblocker の起動処理
+- `sites/` … サイト別のブラウザーパッチと API リレー
 - `public/index.html` … URL入力フォーム
 - `render.yaml` … Render.com 用の設定ファイル（なくてもOK、あると楽）
+
+Gartic Phone のHTTP・WebSocket通信はWorkerを使わず、このサーバーから接続します。
+Gartic Phone向けにはブラウザー形式のリクエストヘッダーを付けますが、
+接続先のCloudflare設定によってはサーバーからのアクセスが拒否される場合があります。
+AbemaTV の `*.abema.tv` への HTTPS 通信は `myproxy-api.xenonsan123.workers.dev` を経由します。
+HTTPS 上の WebSocket は `wss://` で中継し、Unity WebGL 等のゲーム内通信に対応します。
 
 ## 注意事項
 - 個人利用・学習目的の簡易プロキシです。アクセス先サイトの利用規約や著作権、

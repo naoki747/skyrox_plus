@@ -2,17 +2,33 @@
 
 const path = require('path');
 const fs = require('fs');
+const legacyUrl = require('url');
 const express = require('express');
 const compression = require('compression');
 const Unblocker = require('unblocker');
 const http = require('http');
 const https = require('https');
+const { Transform } = require('stream');
+const registerBloxdRelay = require('./sites/bloxd-relay');
+const registerPokiRelay = require('./sites/poki-auth-relay');
+const registerYoutubeRelay = require('./sites/youtube-tv-relay');
+const registerMcpedlRelay = require('./sites/mcpedl-relay');
+const { POKI_CLEAN_NAVIGATION_PATCH } = require('./sites/poki');
+const { TYPINGERZ_FORCE_PROXY_PATCH, TYPINGERZ_NETWORK_PATCH } = require('./sites/typingerz');
+const { BLOXD_RELATIVE_RESOURCE_PATCH } = require('./sites/bloxd');
+const { GLOBAL_PROXIED_NAVIGATION_PATCH } = require('./sites/navigation');
+const { MINECRAFT_DOWNLOAD_NAVIGATION_PATCH } = require('./sites/minecraft');
+const { YOUTUBE_TV_WATERMARK_PATCH } = require('./sites/youtube-tv');
+const { MCPEDL_CLIENT_RECOVERY } = require('./sites/mcpedl');
 
 const app = express();
 const PORT = Number.parseInt(process.env.PORT, 10) || 3000;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const PROXY_PREFIX = '/proxy/';
 const CONTEXT_COOKIE = '__proxy_origin';
+const ABEMA_WORKER_URL = 'https://myproxy-api.xenonsan123.workers.dev/';
+const GARTIC_PHONE_HOST = 'garticphone.com';
+const GARTIC_BROWSER_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
 const POKI_WEB_ORIGIN = 'https://poki.com';
 const POKI_ROUTE_PREFIX = '/jp';
 const POKI_AUTH_HOSTS = new Set(['poki-auth.poki.com']);
@@ -21,7 +37,6 @@ const MAX_SOCKETS = positiveInteger(process.env.MAX_SOCKETS, 64);
 const MAX_FREE_SOCKETS = positiveInteger(process.env.MAX_FREE_SOCKETS, 32);
 const MAX_TOTAL_SOCKETS = positiveInteger(process.env.MAX_TOTAL_SOCKETS, 128);
 const ASSET_CACHE_SECONDS = positiveInteger(process.env.ASSET_CACHE_SECONDS, 1800);
-const CLIENT_HELPER_CACHE_SECONDS = positiveInteger(process.env.CLIENT_HELPER_CACHE_SECONDS, 300);
 const MINECRAFT_DOWNLOAD_HOSTS = new Set([
   'minecraft-mcworld.com',
   'www.minecraft-mcworld.com'
@@ -64,7 +79,7 @@ function sanitizePermissionsPolicyValue(value) {
     .flatMap((item) => String(item || '').split(','))
     .map((item) => item.trim())
     .filter(Boolean)
-    .filter((item) => !/^attribution-reporting\s*=/i.test(item));
+    .filter((item) => !/^(?:attribution-reporting|private-aggregation|join-ad-interest-group|run-ad-auction)\s*=/i.test(item));
   return cleaned.length ? cleaned.join(', ') : null;
 }
 
@@ -361,6 +376,264 @@ function cleanProxyRequest(data) {
   if (!data?.headers) return;
   delete data.headers['proxy-connection'];
 }
+
+function routeAbemaRequestThroughWorker(data) {
+  if (!data?.url || !data?.headers) return;
+
+  const pageOrigin = data.headers['x-skyrox-page-origin'];
+  delete data.headers['x-skyrox-page-origin'];
+
+  let target;
+  try {
+    target = new URL(data.url);
+  } catch {
+    return;
+  }
+  if (target.protocol !== 'https:' || !isAbemaRequest(data, target, pageOrigin)) return;
+  normalizeAbemaHostname(target);
+
+  const workerUrl = new URL(ABEMA_WORKER_URL);
+  workerUrl.searchParams.set('url', target.href);
+  data.abemaOriginalUrl = target.href;
+  data.url = workerUrl.href;
+  data.headers.host = workerUrl.host;
+  const abemaPageOrigin = getAbemaPageOrigin(data, target, pageOrigin);
+  if (data.headers.origin && abemaPageOrigin) data.headers.origin = abemaPageOrigin;
+  if (typeof data.headers.referer === 'string') {
+    try {
+      const referer = new URL(data.headers.referer);
+      normalizeAbemaHostname(referer);
+      data.headers.referer = referer.href;
+    } catch {}
+  }
+
+  if (data.uri) {
+    Object.assign(data.uri, legacyUrl.parse(workerUrl.href));
+  }
+}
+
+function normalizeAbemaHostname(url) {
+  if (url.hostname.toLowerCase() === 'www.abema.tv') {
+    url.hostname = 'abema.tv';
+  }
+}
+
+function getAbemaPageOrigin(data, target, pageOrigin) {
+  if (isAbemaHost(target.hostname)) {
+    normalizeAbemaHostname(target);
+    return target.origin;
+  }
+
+  if (typeof pageOrigin === 'string' && pageOrigin) {
+    try {
+      const parsed = new URL(pageOrigin);
+      if (parsed.protocol !== 'https:' || !isAbemaHost(parsed.hostname)) return null;
+      normalizeAbemaHostname(parsed);
+      return parsed.origin;
+    } catch {
+      return null;
+    }
+  }
+
+  for (const value of [data.headers.referer, data.headers.origin]) {
+    if (typeof value !== 'string' || !value) continue;
+    try {
+      const parsed = new URL(value);
+      if (parsed.protocol === 'https:' && isAbemaHost(parsed.hostname)) {
+        normalizeAbemaHostname(parsed);
+        return parsed.origin;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+function isAbemaRequest(data, target, pageOrigin) {
+  return Boolean(getAbemaPageOrigin(data, target, pageOrigin));
+}
+
+function isAbemaHost(hostname) {
+  const host = String(hostname || '').toLowerCase().replace(/\.$/, '');
+  return host === 'abema.tv' || host.endsWith('.abema.tv');
+}
+
+function restoreAbemaWorkerResponseUrl(data) {
+  if (!data?.abemaOriginalUrl) return;
+
+  let responseUrl = data.abemaOriginalUrl;
+  const finalUrl = data.headers?.['x-proxy-final-url'];
+  if (typeof finalUrl === 'string') {
+    try {
+      const parsed = new URL(finalUrl);
+      if (parsed.protocol === 'https:') responseUrl = parsed.href;
+    } catch {}
+  }
+
+  data.url = responseUrl;
+  if (data.uri) Object.assign(data.uri, legacyUrl.parse(responseUrl));
+}
+
+function findHtmlHeadEnd(source) {
+  let position = 0;
+  while (position < source.length) {
+    const tagStart = source.indexOf('<', position);
+    if (tagStart === -1) return -1;
+
+    if (source.startsWith('<!--', tagStart)) {
+      const commentEnd = source.indexOf('-->', tagStart + 4);
+      if (commentEnd === -1) return -1;
+      position = commentEnd + 3;
+      continue;
+    }
+
+    const openingTag = source.slice(tagStart).match(/^<(head|script|style|textarea|title)\b/i);
+    if (!openingTag) {
+      position = tagStart + 1;
+      continue;
+    }
+
+    const tagEnd = findHtmlTagEnd(source, tagStart + openingTag[0].length);
+    if (tagEnd === -1) return -1;
+    if (openingTag[1].toLowerCase() === 'head') return tagEnd + 1;
+
+    const closingTag = new RegExp(`<\\/\\s*${openingTag[1]}\\s*>`, 'ig');
+    closingTag.lastIndex = tagEnd + 1;
+    const closingMatch = closingTag.exec(source);
+    if (!closingMatch) return -1;
+    position = closingTag.lastIndex;
+  }
+
+  return -1;
+}
+
+function findHtmlTagEnd(source, position) {
+  let quote = '';
+  for (let index = position; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) {
+      if (character === quote) quote = '';
+    } else if (character === '"' || character === "'") {
+      quote = character;
+    } else if (character === '>') {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function injectUnblockerClientSafely(data) {
+  const contentType = String(data?.contentType || data?.headers?.['content-type'] || '').toLowerCase();
+  if (!contentType.includes('text/html') || !data.stream) return;
+
+  const injection = `\n<script src="${PROXY_PREFIX}client/unblocker-client.js"></script>\n` +
+    `<script>unblockerInit(${JSON.stringify({ prefix: PROXY_PREFIX, url: data.url })}, window);</script>\n`;
+  let pending = '';
+  let injected = false;
+
+  data.stream = data.stream.pipe(new Transform({
+    decodeStrings: false,
+    transform(chunk, encoding, callback) {
+      if (injected) {
+        this.push(chunk.toString());
+        callback();
+        return;
+      }
+
+      pending += chunk.toString();
+      const headEnd = findHtmlHeadEnd(pending);
+      if (headEnd !== -1) {
+        this.push(pending.slice(0, headEnd) + injection + pending.slice(headEnd));
+        pending = '';
+        injected = true;
+      } else if (pending.length > 1024 * 1024) {
+        this.push(pending);
+        pending = '';
+        injected = true;
+      }
+      callback();
+    },
+    flush(callback) {
+      if (pending) this.push(pending);
+      callback();
+    }
+  }));
+}
+
+function applyGarticPhoneBrowserHeaders(data) {
+  if (!data?.headers || !data.url) return;
+
+  let target;
+  try {
+    target = new URL(data.url);
+  } catch {
+    return;
+  }
+
+  if (!isGarticPhoneHost(target.hostname)) return;
+
+  const headers = data.headers;
+  headers['user-agent'] ||= GARTIC_BROWSER_USER_AGENT;
+  headers.accept ||= data.isWebsocket
+    ? '*/*'
+    : 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8';
+  headers['accept-language'] ||= 'ja,en-US;q=0.9,en;q=0.8';
+  headers['sec-ch-ua'] ||= '"Chromium";v="140", "Google Chrome";v="140", "Not=A?Brand";v="24"';
+  headers['sec-ch-ua-mobile'] ||= '?0';
+  headers['sec-ch-ua-platform'] ||= '"Windows"';
+
+  let pageUrl;
+  try {
+    pageUrl = new URL(headers.referer);
+  } catch {}
+
+  if (pageUrl && isGarticPhoneHost(pageUrl.hostname)) {
+    const isSameOrigin = pageUrl.origin === target.origin;
+    headers['sec-fetch-site'] = isSameOrigin ? 'same-origin' : 'same-site';
+    if (headers.origin) headers.origin = pageUrl.origin;
+  } else if (!headers['sec-fetch-site']) {
+    headers['sec-fetch-site'] = data.isWebsocket ? 'same-origin' : 'none';
+  }
+
+  if (data.isWebsocket) {
+    headers['sec-fetch-mode'] = 'websocket';
+    headers['sec-fetch-dest'] = 'empty';
+  }
+}
+
+function isGarticPhoneHost(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  return host === GARTIC_PHONE_HOST || host.endsWith(`.${GARTIC_PHONE_HOST}`);
+}
+
+function logTypingerRequest(data) {
+  if (!data?.url || !data?.clientRequest) return;
+
+  let target;
+  try {
+    target = new URL(data.url);
+  } catch {
+    return;
+  }
+
+  const hostname = target.hostname.toLowerCase();
+  if (hostname !== 'typingerz.com' && hostname !== 'www.typingerz.com') return;
+
+  const method = String(data.clientRequest.method || 'GET').toUpperCase();
+  const interesting =
+    method !== 'GET' ||
+    /\/(?:api|ajax|battle|matching|room|socket|ws)/i.test(target.pathname);
+
+  if (!interesting) return;
+
+  console.info(JSON.stringify({
+    type: 'typinger-request',
+    method,
+    url: target.href,
+    origin: data.headers?.origin || null,
+    referer: data.headers?.referer || null,
+    hasCookie: Boolean(data.headers?.cookie)
+  }));
+}
 // Keep Poki authentication requests consistent with the upstream web origin.
 // This does not bypass authentication. A 401 from /sessions/whoami remains the
 // correct response when the browser has no valid Poki session cookie.
@@ -430,8 +703,8 @@ function normalizePokiAuthResponse(data) {
   }
 }
 
-// Chromium versions that do not recognise attribution-reporting emit a noisy
-// console warning. Remove only that unsupported Permissions-Policy directive.
+// Remove unsupported ad-related directives that cause browser warnings and
+// can block APIs used by embedded game pages.
 function sanitizePermissionsPolicy(data) {
   if (!data?.headers || data.headers['permissions-policy'] == null) return;
   const values = Array.isArray(data.headers['permissions-policy'])
@@ -441,7 +714,7 @@ function sanitizePermissionsPolicy(data) {
     .flatMap((value) => String(value).split(','))
     .map((value) => value.trim())
     .filter(Boolean)
-    .filter((value) => !/^attribution-reporting\s*=/i.test(value));
+    .filter((value) => !/^(?:attribution-reporting|private-aggregation|join-ad-interest-group|run-ad-auction)\s*=/i.test(value));
   if (cleaned.length) data.headers['permissions-policy'] = cleaned.join(', ');
   else delete data.headers['permissions-policy'];
 }
@@ -592,85 +865,22 @@ app.use((req, res, next) => {
   next();
 });
 
-// Relay selected Bloxd backend APIs directly. On Cloud Shell, allowing
-// Unblocker to answer an OPTIONS request with a redirect makes the browser reject
-// the preflight. A direct relay keeps the request on this origin and returns CORS
-// headers without attempting to bypass any upstream authentication or challenge.
-app.use(PROXY_PREFIX, relayBloxdBackendApi);
-function relayBloxdBackendApi(req, res, next) {
-  if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'].includes(req.method)) return next();
-  let rawTarget = req.originalUrl.slice(PROXY_PREFIX.length);
-  rawTarget = rawTarget.replace(/^(https?):\/(?!\/)/i, '$1://');
+const relayDependencies = {
+  https,
+  httpsAgent,
+  PROXY_PREFIX,
+  POKI_AUTH_HOSTS,
+  POKI_WEB_ORIGIN,
+  YOUTUBE_TV_USER_AGENT,
+  sanitizeLocationValue,
+  setRelayCors,
+  applyRelayCors,
+  stripHopByHopHeaders,
+  parseCookies,
+  appendVary
+};
 
-  let target;
-  try { target = new URL(rawTarget); } catch { return next(); }
-
-  const hostname = target.hostname.toLowerCase();
-  const allowedHosts = new Set([
-    'firebaseinstallations.googleapis.com',
-    'identitytoolkit.googleapis.com',
-    'securetoken.googleapis.com',
-    'firebaseremoteconfig.googleapis.com'
-  ]);
-  if (target.protocol !== 'https:' || !allowedHosts.has(hostname)) return next();
-
-  if (req.method === 'OPTIONS') {
-    setRelayCors(req, res);
-    return res.status(204).end();
-  }
-
-  const headers = Object.create(null);
-  const blockedRequestHeaders = new Set([
-    'host', 'connection', 'proxy-connection', 'keep-alive',
-    'transfer-encoding', 'upgrade', 'origin', 'referer'
-  ]);
-  for (const [name, value] of Object.entries(req.headers)) {
-    if (!blockedRequestHeaders.has(name.toLowerCase()) && value != null) headers[name] = value;
-  }
-  headers.host = target.host;
-  headers.origin = 'https://bloxd.io';
-  headers.referer = 'https://bloxd.io/';
-
-  const upstream = https.request(target, {
-    method: req.method,
-    headers,
-    agent: httpsAgent,
-    timeout: 30_000
-  }, (remote) => {
-    const responseHeaders = { ...remote.headers };
-    stripHopByHopHeaders(responseHeaders);
-    applyRelayCors(req, responseHeaders);
-    if (responseHeaders.location) {
-      try {
-        const redirected = new URL(responseHeaders.location, target);
-        if (redirected.protocol === 'https:' && allowedHosts.has(redirected.hostname.toLowerCase())) {
-          responseHeaders.location = `${PROXY_PREFIX}${redirected.href}`;
-        }
-      } catch {}
-    }
-    res.writeHead(Number(remote.statusCode || 502), responseHeaders);
-    if (req.method === 'HEAD') {
-      remote.resume();
-      res.end();
-    } else {
-      remote.pipe(res);
-    }
-  });
-
-  upstream.once('timeout', () => upstream.destroy(Object.assign(new Error('upstream timeout'), { code: 'ETIMEDOUT' })));
-  upstream.once('error', (error) => {
-    console.error(JSON.stringify({
-      type: 'bloxd-backend-api-error',
-      host: hostname,
-      code: error.code || 'ERROR',
-      path: target.pathname
-    }));
-    if (!res.headersSent) res.status(502).send('Bad Gateway');
-    else res.destroy(error);
-  });
-  req.once('aborted', () => upstream.destroy());
-  req.pipe(upstream);
-}
+registerBloxdRelay(app, relayDependencies);
 
 function setRelayCors(req, res) {
   const origin = req.get('origin');
@@ -697,252 +907,33 @@ function stripHopByHopHeaders(headers) {
   ]) delete headers[name];
 }
 
-// Relay Poki authentication directly. Keeping this endpoint out of the generic
-// HTML proxy avoids losing Set-Cookie headers and preserves the upstream request
-// method/body. Authentication is not bypassed: an anonymous whoami still returns 401.
-app.use(PROXY_PREFIX, relayPokiAuthApi);
-function relayPokiAuthApi(req, res, next) {
-  if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'].includes(req.method)) return next();
-  let rawTarget = req.originalUrl.slice(PROXY_PREFIX.length);
-  rawTarget = rawTarget.replace(/^(https?):\/(?!\/)/i, '$1://');
-  let target;
-  try { target = new URL(rawTarget); } catch { return next(); }
-  if (target.protocol !== 'https:' || !POKI_AUTH_HOSTS.has(target.hostname.toLowerCase())) return next();
-
-  if (req.method === 'OPTIONS') {
-    setRelayCors(req, res);
-    return res.status(204).end();
-  }
-
-  const headers = Object.create(null);
-  for (const name of [
-    'accept', 'accept-encoding', 'accept-language', 'authorization',
-    'content-type', 'content-length', 'user-agent', 'x-csrf-token', 'x-xsrf-token'
-  ]) {
-    if (req.headers[name] != null) headers[name] = req.headers[name];
-  }
-  const upstreamCookie = decodePokiAuthCookies(req.headers.cookie);
-  if (upstreamCookie) headers.cookie = upstreamCookie;
-  headers.host = target.host;
-  headers.origin = POKI_WEB_ORIGIN;
-  headers.referer = `${POKI_WEB_ORIGIN}/`;
-
-  const upstream = https.request(target, {
-    method: req.method,
-    headers,
-    agent: httpsAgent,
-    timeout: 30_000
-  }, (remote) => {
-    const responseHeaders = { ...remote.headers };
-    stripHopByHopHeaders(responseHeaders);
-    responseHeaders['cache-control'] = 'private, no-store, max-age=0';
-    responseHeaders.pragma = 'no-cache';
-    delete responseHeaders.expires;
-    applyRelayCors(req, responseHeaders);
-
-    const setCookies = remote.headers['set-cookie'];
-    if (setCookies) {
-      responseHeaders['set-cookie'] = (Array.isArray(setCookies) ? setCookies : [setCookies])
-        .map(encodePokiAuthSetCookie);
-    }
-    if (responseHeaders.location) {
-      try {
-        responseHeaders.location = `${PROXY_PREFIX}${new URL(responseHeaders.location, target).href}`;
-      } catch {}
-    }
-    res.writeHead(Number(remote.statusCode || 502), responseHeaders);
-    if (req.method === 'HEAD') { remote.resume(); res.end(); }
-    else remote.pipe(res);
-  });
-  upstream.once('timeout', () => upstream.destroy(Object.assign(new Error('upstream timeout'), { code: 'ETIMEDOUT' })));
-  upstream.once('error', (error) => {
-    console.error(JSON.stringify({ type: 'poki-auth-api-error', code: error.code || 'ERROR', path: target.pathname }));
-    if (!res.headersSent) res.status(502).send('Bad Gateway');
-    else res.destroy(error);
-  });
-  req.once('aborted', () => upstream.destroy());
-  req.pipe(upstream);
-}
-
-const POKI_AUTH_COOKIE_PREFIX = '__poki_auth__';
-function encodePokiAuthSetCookie(cookie) {
-  const parts = String(cookie).split(';');
-  const first = parts.shift();
-  const separator = first.indexOf('=');
-  if (separator < 1) return cookie;
-  const name = first.slice(0, separator).trim();
-  const value = first.slice(separator + 1);
-  const attributes = parts
-    .map((part) => part.trim())
-    .filter((part) => !/^domain=/i.test(part) && !/^path=/i.test(part) && !/^samesite=/i.test(part));
-  attributes.push('Path=/');
-  attributes.push('SameSite=Lax');
-  if (!attributes.some((part) => /^secure$/i.test(part))) attributes.push('Secure');
-  return `${POKI_AUTH_COOKIE_PREFIX}${encodeURIComponent(name)}=${value}; ${attributes.join('; ')}`;
-}
-
-function decodePokiAuthCookies(header) {
-  const cookies = parseCookies(header);
-  const result = [];
-  for (const [name, value] of Object.entries(cookies)) {
-    if (!name.startsWith(POKI_AUTH_COOKIE_PREFIX)) continue;
-    let upstreamName;
-    try { upstreamName = decodeURIComponent(name.slice(POKI_AUTH_COOKIE_PREFIX.length)); }
-    catch { continue; }
-    if (upstreamName) result.push(`${upstreamName}=${value}`);
-  }
-  return result.join('; ');
-}
-
-// Relay YouTube TV account APIs directly. Unblocker normalizes a target like
-// https://www.youtube.com/... into a 307 Location containing https:/..., which
-// breaks POST-based device OAuth and account discovery in a redirect loop.
-app.use(PROXY_PREFIX, relayYouTubeTvAccountApi);
-function relayYouTubeTvAccountApi(req, res, next) {
-  if (!['GET', 'POST', 'OPTIONS'].includes(req.method)) return next();
-  let rawTarget = req.originalUrl.slice(PROXY_PREFIX.length);
-  rawTarget = rawTarget.replace(/^(https?):\/(?!\/)/i, '$1://');
-  let target;
-  try { target = new URL(rawTarget); } catch { return next(); }
-  const host = target.hostname.toLowerCase();
-  if (target.protocol !== 'https:' || (host !== 'youtube.com' && host !== 'www.youtube.com')) return next();
-  const allowed = target.pathname === '/o/oauth2/token' ||
-    target.pathname.startsWith('/youtubei/v1/account/') ||
-    target.pathname.startsWith('/api/lounge/');
-  if (!allowed) return next();
-  if (req.method === 'OPTIONS') {
-    setYouTubeTvCors(req, res);
-    return res.status(204).end();
-  }
-  const headers = Object.create(null);
-  const forwarded = [
-    'accept', 'accept-encoding', 'accept-language', 'authorization',
-    'content-type', 'cookie', 'x-goog-request-time', 'x-goog-visitor-id',
-    'x-youtube-client-name', 'x-youtube-client-version',
-    'x-youtube-lava-device-context', 'x-youtube-page-cl', 'x-youtube-page-label'
-  ];
-  for (const name of forwarded) if (req.headers[name] != null) headers[name] = req.headers[name];
-  headers.host = target.host;
-  headers['user-agent'] = YOUTUBE_TV_USER_AGENT;
-  headers.origin = 'https://www.youtube.com';
-  headers.referer = 'https://www.youtube.com/tv';
-  if (req.headers['content-length'] != null) headers['content-length'] = req.headers['content-length'];
-  const upstream = https.request(target, {
-    method: req.method,
-    headers,
-    agent: httpsAgent,
-    timeout: 30_000
-  }, (remote) => {
-    const responseHeaders = { ...remote.headers };
-    for (const name of ['connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailer','transfer-encoding','upgrade']) {
-      delete responseHeaders[name];
-    }
-    // The browser talks to this proxy origin, so expose the API response there.
-    const origin = req.get('origin');
-    if (origin) {
-      responseHeaders['access-control-allow-origin'] = origin;
-      responseHeaders['access-control-allow-credentials'] = 'true';
-      responseHeaders.vary = appendVary(responseHeaders.vary, 'Origin');
-    }
-    if (responseHeaders.location) {
-      try {
-        const redirected = new URL(responseHeaders.location, target);
-        if (redirected.protocol === 'https:' &&
-            (redirected.hostname === 'youtube.com' || redirected.hostname === 'www.youtube.com')) {
-          responseHeaders.location = `${PROXY_PREFIX}${redirected.href}`;
-        }
-      } catch {}
-    }
-    res.writeHead(Number(remote.statusCode || 502), responseHeaders);
-    remote.pipe(res);
-  });
-  upstream.once('timeout', () => upstream.destroy(Object.assign(new Error('upstream timeout'), { code: 'ETIMEDOUT' })));
-  upstream.once('error', (error) => {
-    console.error(JSON.stringify({ type: 'youtube-tv-account-api-error', code: error.code || 'ERROR', path: target.pathname }));
-    if (!res.headersSent) res.status(502).send('Bad Gateway');
-    else res.destroy(error);
-  });
-  req.once('aborted', () => upstream.destroy());
-  req.pipe(upstream);
-}
-function setYouTubeTvCors(req, res) {
-  const origin = req.get('origin');
-  if (origin) res.set('Access-Control-Allow-Origin', origin);
-  res.set('Access-Control-Allow-Credentials', 'true');
-  res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.set('Access-Control-Allow-Headers', req.get('access-control-request-headers') || 'content-type,authorization');
-  res.set('Vary', 'Origin, Access-Control-Request-Headers');
-}
 function appendVary(current, value) {
   const values = String(current || '').split(',').map((item) => item.trim()).filter(Boolean);
   if (!values.some((item) => item.toLowerCase() === value.toLowerCase())) values.push(value);
   return values.join(', ');
 }
 
-// MCPEDL loads many Nuxt chunks simultaneously. Relay only its static assets
-// directly and retry one safe GET/HEAD once on transient upstream failures.
-app.use(PROXY_PREFIX, relayMcpedlStaticAsset);
+registerPokiRelay(app, relayDependencies);
 
-function relayMcpedlStaticAsset(req, res, next) {
-  if (req.method !== 'GET' && req.method !== 'HEAD') return next();
-  let target;
-  try {
-    target = new URL(req.originalUrl.slice(PROXY_PREFIX.length));
-  } catch {
-    return next();
-  }
-  const host = target.hostname.toLowerCase();
-  if (target.protocol !== 'https:' || (host !== 'mcpedl.com' && host !== 'www.mcpedl.com')) return next();
-  if (!target.pathname.startsWith('/_nuxt/') && !target.pathname.startsWith('/js/') && !target.pathname.startsWith('/web/')) return next();
-  if (!/\.(?:js|mjs|css|map|woff2?|ttf|otf|eot|png|jpe?g|gif|webp|svg|ico)$/i.test(target.pathname)) return next();
-  requestMcpedlStatic(target, req, res, Date.now(), 0);
-}
+registerYoutubeRelay(app, relayDependencies);
 
-function requestMcpedlStatic(target, req, res, startedAt, attempt) {
-  if (res.headersSent || res.destroyed) return;
-  const headers = Object.create(null);
-  for (const name of ['accept','accept-encoding','accept-language','cache-control','if-modified-since','if-none-match','range','user-agent']) {
-    if (req.headers[name] != null) headers[name] = req.headers[name];
-  }
-  headers.host = target.host;
-  headers.referer = `${target.origin}/`;
+registerMcpedlRelay(app, relayDependencies);
 
-  const upstream = https.request(target, { method: req.method, headers, agent: httpsAgent, timeout: 20_000 }, (remote) => {
-    const status = Number(remote.statusCode || 502);
-    if (attempt === 0 && [502, 503, 504].includes(status)) {
-      remote.resume();
-      remote.once('end', () => setTimeout(() => requestMcpedlStatic(target, req, res, startedAt, 1), 150));
-      return;
-    }
-    const responseHeaders = { ...remote.headers };
-    for (const name of ['connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailer','transfer-encoding','upgrade']) delete responseHeaders[name];
-    if (responseHeaders.location != null) responseHeaders.location = sanitizeLocationValue(responseHeaders.location);
-    res.writeHead(status, responseHeaders);
-    if (req.method === 'HEAD') { remote.resume(); res.end(); } else remote.pipe(res);
-    remote.once('end', () => console.log(JSON.stringify({ type:'mcpedl-static', status, attempt, elapsedMs:Date.now()-startedAt, path:target.pathname })));
-  });
-  upstream.once('timeout', () => upstream.destroy(Object.assign(new Error('upstream timeout'), { code:'ETIMEDOUT' })));
-  upstream.once('error', (error) => {
-    if (attempt === 0 && !res.headersSent) {
-      console.warn(JSON.stringify({ type:'mcpedl-static-retry', code:error.code || 'ERROR', path:target.pathname }));
-      setTimeout(() => requestMcpedlStatic(target, req, res, startedAt, 1), 150);
-    } else if (!res.headersSent) {
-      console.error(JSON.stringify({ type:'mcpedl-static-error', code:error.code || 'ERROR', message:error.message, path:target.pathname }));
-      res.status(502).send('Bad Gateway');
-    } else res.destroy(error);
-  });
-  req.once('aborted', () => upstream.destroy());
-  upstream.end();
-}
-
-const unblocker = new Unblocker({
+const unblockerConfig = {
   prefix: PROXY_PREFIX,
   cookieRewrite: true,
   redirectFollow: true,
-  clientScripts: true,
+  clientScripts: false,
   httpAgent,
   httpsAgent,
-  requestMiddleware: [cleanProxyRequest, applyPokiRequestContext, applyYouTubeTvUserAgent],
+  requestMiddleware: [
+    cleanProxyRequest,
+    logTypingerRequest,
+    applyPokiRequestContext,
+    applyYouTubeTvUserAgent,
+    applyGarticPhoneBrowserHeaders,
+    routeAbemaRequestThroughWorker
+  ],
   responseMiddleware: [
     repairMalformedProxyLocation,
     keepPokiRedirectOnCleanRoute,
@@ -953,9 +944,12 @@ const unblocker = new Unblocker({
     sanitizeProxyResponseHeaders,
     rememberDocumentOrigin,
     preserveDownloadResponse,
-    addConservativeAssetCache
+    addConservativeAssetCache,
+    injectUnblockerClientSafely
   ]
-});
+};
+const unblocker = new Unblocker(unblockerConfig);
+unblockerConfig.responseMiddleware.unshift(restoreAbemaWorkerResponseUrl);
 
 // Prefer the package's local browser helper. If its layout differs, fall back
 // to Unblocker's own route instead of returning a false 404.
@@ -977,6 +971,13 @@ if (unblockerClientPath) {
 // of fixUrl so both strings and URL-like Trusted Types values are supported.
 function patchUnblockerClientForUrlObjects(source) {
   let patched = String(source || '');
+
+  // Unblocker compares location.protocol with "https" instead of "https:".
+  // On HTTPS deployments this incorrectly creates insecure ws:// proxy URLs.
+  patched = patched.replace(
+    /location\.protocol\s*===\s*["']https["']/g,
+    'location.protocol === "https:"'
+  );
 
   // note uses Next.js/webpack and can pass URL, TrustedScriptURL, TrustedURL,
   // or other string-like values to script/link setters. Older unblocker builds
@@ -1007,12 +1008,9 @@ function patchUnblockerClientForUrlObjects(source) {
 function sendPatchedUnblockerClient(req, res, next) {
   if (!unblockerClientSource) return next();
   res.set('Content-Type', 'application/javascript; charset=utf-8');
-  // This helper is identical for every page in the current deployment. A short
-  // browser cache avoids downloading and parsing it again on every navigation,
-  // while still allowing fixes to propagate quickly after a deployment.
-  res.set('Cache-Control', `private, max-age=${CLIENT_HELPER_CACHE_SECONDS}, must-revalidate`);
+  res.set('Cache-Control', 'no-cache');
   res.set('X-Content-Type-Options', 'nosniff');
-  res.send(`${unblockerClientSource}\n${BLOXD_RELATIVE_RESOURCE_PATCH}\n${GLOBAL_PROXIED_NAVIGATION_PATCH}\n${MINECRAFT_DOWNLOAD_NAVIGATION_PATCH}\n${YOUTUBE_TV_WATERMARK_PATCH}\n${MCPEDL_CLIENT_RECOVERY}\n${POKI_CLEAN_NAVIGATION_PATCH}`);
+  res.send(`${unblockerClientSource}\n${TYPINGERZ_FORCE_PROXY_PATCH}\n${TYPINGERZ_NETWORK_PATCH}\n${BLOXD_RELATIVE_RESOURCE_PATCH}\n${GLOBAL_PROXIED_NAVIGATION_PATCH}\n${MINECRAFT_DOWNLOAD_NAVIGATION_PATCH}\n${YOUTUBE_TV_WATERMARK_PATCH}\n${MCPEDL_CLIENT_RECOVERY}\n${POKI_CLEAN_NAVIGATION_PATCH}`);
 }
 
 // Different unblocker releases emit either path. Register both before
@@ -1024,358 +1022,23 @@ app.get(`${PROXY_PREFIX}unblocker-client.js`, sendPatchedUnblockerClient);
 // cover many DOM assignments, but sites such as DuckDuckGo can install a
 // direct absolute result URL after rendering. Capture navigation gestures and
 // normalize those links before the browser leaves this origin.
-const POKI_CLEAN_NAVIGATION_PATCH = String.raw`;(function () {
-  'use strict';
-  var PREFIX = '/proxy/';
-  function cleanPokiUrl(value) {
-    if (!value) return null;
-    var raw = String(value);
-    if (raw.indexOf(PREFIX) === 0) raw = raw.slice(PREFIX.length);
-    try {
-      var url = new URL(raw, 'https://poki.com');
-      var host = String(url.hostname || '').toLowerCase();
-      if ((host === 'poki.com' || host === 'www.poki.com') &&
-          (url.pathname === '/jp' || url.pathname.indexOf('/jp/') === 0)) {
-        return url.pathname + url.search + url.hash;
-      }
-    } catch (error) {}
-    return null;
-  }
-  function rewrite(root) {
-    if (!root) return;
-    var nodes = [];
-    if (root.nodeType === 1 && root.matches && root.matches('a[href]')) nodes.push(root);
-    if (root.querySelectorAll) nodes = nodes.concat(Array.prototype.slice.call(root.querySelectorAll('a[href]')));
-    for (var i = 0; i < nodes.length; i += 1) {
-      var clean = cleanPokiUrl(nodes[i].getAttribute('href'));
-      if (clean) nodes[i].setAttribute('href', clean);
-    }
-  }
-  function start() {
-    rewrite(document.documentElement);
-    new MutationObserver(function (records) {
-      for (var i = 0; i < records.length; i += 1) {
-        if (records[i].type === 'attributes') rewrite(records[i].target);
-        for (var j = 0; j < records[i].addedNodes.length; j += 1) rewrite(records[i].addedNodes[j]);
-      }
-    }).observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ['href'] });
-  }
-  document.addEventListener('click', function (event) {
-    var anchor = event.target && event.target.closest ? event.target.closest('a[href], [data-tile-url]') : null;
-    if (!anchor) return;
-    var clean = cleanPokiUrl(anchor.getAttribute('href') || anchor.getAttribute('data-tile-url'));
-    if (!clean) return;
-    event.preventDefault();
-    event.stopPropagation();
-    event.stopImmediatePropagation();
-    window.location.assign(clean);
-  }, true);
-  if (document.documentElement) start();
-  else document.addEventListener('DOMContentLoaded', start, { once: true });
-})();`;
 
-const BLOXD_RELATIVE_RESOURCE_PATCH = String.raw`;(function () {
-  'use strict';
-  var PREFIX = '/proxy/';
-  function upstream() {
-    var path = String(window.location.pathname || '');
-    if (path.indexOf(PREFIX) !== 0) return null;
-    var raw = path.slice(PREFIX.length) + String(window.location.search || '');
-    raw = raw.replace(/^(https?):\/(?!\/)/i, '$1://');
-    try { return new URL(raw); } catch (error) { return null; }
-  }
-  function fix(value) {
-    if (typeof value !== 'string' || value.charAt(0) !== '/' || value.indexOf('//') === 0 || value.indexOf(PREFIX) === 0) return value;
-    var base = upstream();
-    if (!base) return value;
-    try { return PREFIX + new URL(value, base.origin).href; } catch (error) { return value; }
-  }
-  function rewrite(root) {
-    if (!root || root.nodeType !== 1) return;
-    var nodes = [root];
-    if (root.querySelectorAll) nodes = nodes.concat(Array.prototype.slice.call(root.querySelectorAll('[src],[href],[poster]')));
-    for (var i = 0; i < nodes.length; i += 1) {
-      for (var j = 0; j < 3; j += 1) {
-        var attr = ['src', 'href', 'poster'][j];
-        if (!nodes[i].hasAttribute || !nodes[i].hasAttribute(attr)) continue;
-        var before = nodes[i].getAttribute(attr);
-        var after = fix(before);
-        if (after !== before) nodes[i].setAttribute(attr, after);
-      }
-    }
-  }
-  function start() {
-    rewrite(document.documentElement);
-    new MutationObserver(function (records) {
-      for (var i = 0; i < records.length; i += 1) {
-        if (records[i].type === 'attributes') rewrite(records[i].target);
-        for (var j = 0; j < records[i].addedNodes.length; j += 1) rewrite(records[i].addedNodes[j]);
-      }
-    }).observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ['src', 'href', 'poster'] });
-  }
-  if (document.documentElement) start();
-  else document.addEventListener('DOMContentLoaded', start, { once: true });
-})();`;
+// Typinger Z emits some image URLs through inline styles and late JavaScript.
+// Those assignments can bypass ordinary anchor/src rewriting, so synchronously
+// normalize every typingerz.com URL before the browser starts the request.
 
-const GLOBAL_PROXIED_NAVIGATION_PATCH = String.raw`;(function () {
-  'use strict';
-  var PREFIX = '/proxy/';
-
-  function upstreamPageUrl() {
-    var path = String(window.location.pathname || '');
-    if (path.indexOf(PREFIX) !== 0) return null;
-    var raw = path.slice(PREFIX.length) + String(window.location.search || '') + String(window.location.hash || '');
-    raw = raw.replace(/^(https?):\/(?!\/)/i, '$1://');
-    try {
-      var url = new URL(raw);
-      return /^https?:$/.test(url.protocol) ? url : null;
-    } catch (error) {
-      return null;
-    }
-  }
-
-  function unwrapDuckDuckGoRedirect(url) {
-    var host = String(url.hostname || '').toLowerCase();
-    if (host !== 'duckduckgo.com' && host !== 'www.duckduckgo.com' && host !== 'links.duckduckgo.com') return url;
-    var encoded = url.searchParams.get('uddg');
-    if (!encoded) return url;
-    try {
-      var destination = new URL(encoded);
-      if (/^https?:$/.test(destination.protocol)) return destination;
-    } catch (error) {}
-    return url;
-  }
-
-  function proxiedHref(anchor) {
-    if (!anchor || !anchor.getAttribute) return null;
-    var raw = anchor.getAttribute('href');
-    if (!raw || raw.charAt(0) === '#' || /^(?:javascript|mailto|tel|data|blob):/i.test(raw)) return null;
-    if (raw.indexOf(PREFIX) === 0) return null;
-
-    var upstream = upstreamPageUrl();
-    if (!upstream) return null;
-
-    var target;
-    try {
-      target = new URL(raw, upstream);
-    } catch (error) {
-      return null;
-    }
-    if (!/^https?:$/.test(target.protocol)) return null;
-    target = unwrapDuckDuckGoRedirect(target);
-    return PREFIX + target.href;
-  }
-
-  function rewriteAnchor(event) {
-    var node = event.target;
-    var anchor = node && node.closest ? node.closest('a[href]') : null;
-    if (!anchor) return;
-    var fixed = proxiedHref(anchor);
-    if (fixed) anchor.setAttribute('href', fixed);
-  }
-
-  // pointerdown/mousedown makes middle-click, Ctrl/Cmd-click and context-menu
-  // "open in new tab" see the rewritten href before the browser navigates.
-  document.addEventListener('pointerdown', rewriteAnchor, true);
-  document.addEventListener('mousedown', rewriteAnchor, true);
-  document.addEventListener('contextmenu', rewriteAnchor, true);
-  document.addEventListener('click', rewriteAnchor, true);
-  document.addEventListener('auxclick', rewriteAnchor, true);
-})();`;
 // Cloud Shell reserves the top-level /dl/ path. Crafters Colony's original
 // download_bt_func navigates there, so intercept the gesture before the site's
 // inline onclick handler and navigate directly to the proxied upstream /dl/.
-const MINECRAFT_DOWNLOAD_NAVIGATION_PATCH = String.raw`;(function () {
-  'use strict';
-  var PREFIX = '/proxy/';
-
-  function upstreamPageUrl() {
-    var path = String(window.location.pathname || '');
-    if (path.indexOf(PREFIX) !== 0) return null;
-    var raw = path.slice(PREFIX.length) + String(window.location.search || '');
-    raw = raw.replace(/^(https?):\/(?!\/)/i, '$1://');
-    try {
-      var url = new URL(raw);
-      return /^https?:$/.test(url.protocol) ? url : null;
-    } catch (error) {
-      return null;
-    }
-  }
-
-  function isMinecraftPage() {
-    var upstream = upstreamPageUrl();
-    if (!upstream) return false;
-    var host = String(upstream.hostname || '').toLowerCase();
-    return host === 'minecraft-mcworld.com' || host === 'www.minecraft-mcworld.com';
-  }
-
-  function downloadUrl(postid, type) {
-    var target = new URL('https://minecraft-mcworld.com/dl/');
-    target.searchParams.set('postid', String(postid));
-    target.searchParams.set('type', String(type == null ? 0 : type));
-    return PREFIX + target.href;
-  }
-
-  function parseInvocation(node) {
-    var clickable = node && node.closest
-      ? node.closest('[onclick*="download_bt_func"]')
-      : null;
-    if (!clickable) return null;
-    var source = String(clickable.getAttribute('onclick') || '');
-    var match = source.match(/download_bt_func\s*\(\s*['"]?(\d+)['"]?\s*,\s*['"]?(\d+)['"]?\s*\)/);
-    return match ? { postid: match[1], type: match[2] } : null;
-  }
-
-  // Capture phase runs before the page's inline onclick handler.
-  document.addEventListener('click', function (event) {
-    if (!isMinecraftPage()) return;
-    var invocation = parseInvocation(event.target);
-    if (!invocation) return;
-    event.preventDefault();
-    event.stopPropagation();
-    event.stopImmediatePropagation();
-    var destination = downloadUrl(invocation.postid, invocation.type);
-    console.info('[proxy] Minecraft download navigation:', destination);
-    window.location.assign(destination);
-  }, true);
-
-  // Also replace the global function for keyboard/programmatic invocations.
-  var attempts = 0;
-  function installFunctionPatch() {
-    attempts += 1;
-    if (!isMinecraftPage()) return;
-    var original = window.download_bt_func;
-    if (typeof original === 'function' && !original.__proxyDownloadPatched) {
-      function patched(postid, type) {
-        window.location.assign(downloadUrl(postid, type));
-      }
-      patched.__proxyDownloadPatched = true;
-      patched.__proxyOriginal = original;
-      window.download_bt_func = patched;
-      return;
-    }
-    if (attempts < 300) window.setTimeout(installFunctionPatch, 100);
-  }
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', installFunctionPatch, { once: true });
-  } else {
-    installFunctionPatch();
-  }
-})();`;
 
 // YouTube TV inserts <yt-debug-watermark> when the current host is not an
 // approved debug-access domain. This UI-only patch removes that warning node
 // and watches for later re-insertion by client-side rendering.
-const YOUTUBE_TV_WATERMARK_PATCH = String.raw`;(function () {
-  'use strict';
-  // Keep the post-login /tv return URL on the proxy origin. YouTube may use an
-  // absolute top-level navigation which cannot be fixed by response headers.
-  function proxyYouTubeTvUrl(value) {
-    try {
-      var url = new URL(String(value), 'https://www.youtube.com');
-      if ((url.hostname === 'youtube.com' || url.hostname === 'www.youtube.com') &&
-          (url.pathname === '/tv' || url.pathname.indexOf('/tv/') === 0)) {
-        return '/proxy/' + url.href;
-      }
-    } catch (error) {}
-    return value;
-  }
-  document.addEventListener('click', function (event) {
-    var element = event.target && event.target.closest ? event.target.closest('a[href]') : null;
-    if (!element) return;
-    var fixed = proxyYouTubeTvUrl(element.getAttribute('href'));
-    if (fixed !== element.getAttribute('href')) element.setAttribute('href', fixed);
-  }, true);
-  function isYouTubeTvPage() {
-    var path = String(window.location.pathname || '').toLowerCase();
-    return path.indexOf('/proxy/https://www.youtube.com/tv') === 0 ||
-      path.indexOf('/proxy/https://youtube.com/tv') === 0;
-  }
-  if (!isYouTubeTvPage()) return;
-  function removeDebugWatermarks(root) {
-    if (!root) return;
-    if (root.nodeType === 1 && root.matches && root.matches('yt-debug-watermark')) {
-      root.remove();
-      return;
-    }
-    if (!root.querySelectorAll) return;
-    var nodes = root.querySelectorAll('yt-debug-watermark');
-    for (var i = 0; i < nodes.length; i += 1) nodes[i].remove();
-  }
-  function start() {
-    removeDebugWatermarks(document);
-    var observer = new MutationObserver(function (records) {
-      for (var i = 0; i < records.length; i += 1) {
-        var added = records[i].addedNodes;
-        for (var j = 0; j < added.length; j += 1) removeDebugWatermarks(added[j]);
-      }
-    });
-    observer.observe(document.documentElement, { childList: true, subtree: true });
-  }
-  if (document.documentElement) start();
-  else document.addEventListener('DOMContentLoaded', start, { once: true });
-})();`;
 
 // MCPEDL marks the home-page Nuxt fetch as client-only. When its cached SSR
 // response contains frontpageV2=null, hydration can leave all shelves empty.
 // Retry the site's own Vuex action after Nuxt is ready. The existing XHR/fetch
 // wrappers proxy the api.mcpedl.com request through this server.
-const MCPEDL_CLIENT_RECOVERY = String.raw`;(function () {
-  'use strict';
-
-  if (window.location.pathname.toLowerCase().indexOf('mcpedl.com') === -1) return;
-
-  var tries = 0;
-  var maxTries = 80;
-  var running = false;
-  var completed = false;
-
-  function hasFrontpage(store) {
-    var submission = store && store.state && store.state.submission;
-    var value = submission && submission.frontpageV2;
-    return !!(value && value.shelves);
-  }
-
-  function recover() {
-    if (completed || running) return;
-    tries += 1;
-
-    var nuxt = window.$nuxt;
-    var store = nuxt && nuxt.$store;
-    if (!store || typeof store.dispatch !== 'function') {
-      if (tries < maxTries) window.setTimeout(recover, 250);
-      return;
-    }
-
-    if (hasFrontpage(store)) {
-      completed = true;
-      return;
-    }
-
-    running = true;
-    Promise.resolve(store.dispatch('submission/fetchFrontpageV2'))
-      .then(function () {
-        running = false;
-        if (hasFrontpage(store)) {
-          completed = true;
-          console.info('[proxy] MCPEDL front page recovered');
-          return;
-        }
-        if (tries < maxTries) window.setTimeout(recover, 750);
-      })
-      .catch(function (error) {
-        running = false;
-        console.warn('[proxy] MCPEDL front page retry failed', error);
-        if (tries < maxTries) window.setTimeout(recover, 1000);
-      });
-  }
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', recover, { once: true });
-  } else {
-    recover();
-  }
-})();`;
 
 function findUnblockerClientScript() {
   let entry;
@@ -1401,12 +1064,12 @@ function findNamedFile(directory, filename, depth) {
   return null;
 }
 
-app.use(unblocker);
-
-app.get('/healthz', (req, res) => {
+app.get(['/healthz', '/__proxy-local/healthz'], (req, res) => {
   res.set('Cache-Control', 'no-store');
   res.status(200).send('ok');
 });
+
+app.use(unblocker);
 
 app.get('/', (req, res, next) => {
   res.sendFile(path.join(PUBLIC_DIR, 'index.html'), (error) => {
@@ -1433,7 +1096,49 @@ server.on('upgrade', (req, socket, head) => {
   socket.setNoDelay(true);
   socket.setKeepAlive(true, 30_000);
   socket.setTimeout(0);
-  handleUpgrade(req, socket, head);
+
+  try {
+    req.url = repairProxyPath(req.url);
+
+    if (!req.url.startsWith(PROXY_PREFIX)) {
+      const refererOrigin = getOriginFromProxyReferer(req);
+      const cookieOrigin = getOriginFromContextCookie(req);
+      const upstreamOrigin = req.headers.referer ? refererOrigin : cookieOrigin;
+
+      if (upstreamOrigin) {
+        const target = new URL(req.url, `${upstreamOrigin}/`);
+        if (isHttpOrigin(target)) {
+          const originalUrl = req.url;
+          req.url = `${PROXY_PREFIX}${target.href}`;
+          console.info(JSON.stringify({
+            type: 'websocket-relative-url-rewritten',
+            originalUrl,
+            target: target.href,
+            proxyUrl: req.url
+          }));
+        }
+      }
+    }
+
+    handleUpgrade(req, socket, head);
+  } catch (error) {
+    console.error(JSON.stringify({
+      type: 'websocket-upgrade-error',
+      message: error.message,
+      url: req.url
+    }));
+
+    if (!socket.destroyed) {
+      socket.write(
+        'HTTP/1.1 502 Bad Gateway\r\n' +
+        'Connection: close\r\n' +
+        'Content-Type: text/plain; charset=utf-8\r\n' +
+        '\r\n' +
+        'WebSocket proxy error'
+      );
+      socket.destroy();
+    }
+  }
 });
 
 function getOriginFromProxyReferer(req) {
@@ -1512,8 +1217,7 @@ function isHttpOrigin(url) {
 function isLocalRoute(pathname) {
   return pathname === '/' ||
     pathname === '/healthz' ||
-    pathname === '/favicon.ico' ||
-    pathname === '/robots.txt';
+    pathname === '/__proxy-local/healthz';
 }
 
 function positiveInteger(value, fallback) {

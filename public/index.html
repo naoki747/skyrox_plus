@@ -3,6 +3,37 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script>
+  if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations) {
+    navigator.serviceWorker.getRegistrations()
+      .then(function (registrations) {
+        return Promise.all(registrations.map(function (registration) {
+          var workers = [registration.active, registration.waiting, registration.installing];
+          var isProxyWorker = workers.some(function (worker) {
+            if (!worker) return false;
+            var workerUrl = new URL(worker.scriptURL);
+            return workerUrl.origin === window.location.origin &&
+              workerUrl.pathname === '/proxy-service-worker.js';
+          });
+          return isProxyWorker ? registration.unregister() : Promise.resolve();
+        }));
+      })
+      .then(function () {
+        if (!navigator.serviceWorker.controller) return;
+        var reloadKey = '__skyrox_proxy_sw_cleanup_reload';
+        try {
+          if (sessionStorage.getItem(reloadKey)) return;
+          sessionStorage.setItem(reloadKey, '1');
+          window.location.reload();
+        } catch (error) {
+          console.warn('[proxy] Could not reload after service worker cleanup:', error);
+        }
+      })
+      .catch(function (error) {
+        console.warn('[proxy] Service worker cleanup failed:', error);
+      });
+  }
+</script>
 <title>Skyrox Plus</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -252,10 +283,22 @@
     function faviconFor(destination) {
       try {
         const url = new URL(destination);
-        return url.origin + '/favicon.ico';
+        return proxyGarticPhoneUrl(url.origin + '/favicon.ico');
       } catch {
         return 'https://duckduckgo.com/favicon.ico';
       }
+    }
+
+    function proxyGarticPhoneUrl(value) {
+      try {
+        const url = new URL(value, window.location.href);
+        const host = url.hostname.toLowerCase();
+        if ((host === 'garticphone.com' || host.endsWith('.garticphone.com')) &&
+            (url.protocol === 'http:' || url.protocol === 'https:')) {
+          return '/proxy/' + url.href;
+        }
+      } catch {}
+      return value;
     }
 
     function labelFor(input, destination) {
@@ -308,7 +351,7 @@
         link.addEventListener('click', () => openDestination(item.destination));
 
         const icon = document.createElement('img');
-        icon.src = item.favicon;
+        icon.src = proxyGarticPhoneUrl(item.favicon);
         icon.alt = '';
         icon.loading = 'lazy';
         icon.addEventListener('error', () => {
